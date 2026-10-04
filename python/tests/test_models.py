@@ -25,6 +25,7 @@ from pydantic import BaseModel, ValidationError
 
 from ossie import (
     OssieAIContextObject,
+    OssieCustomExtension,
     OssieDataset,
     OssieDataType,
     OssieDialect,
@@ -288,6 +289,85 @@ def test_only_document_rejects_extra_fields(document_data: dict) -> None:
 
     assert any(
         item["loc"] == ("vendor_extension",) and item["type"] == "extra_forbidden"
+        for item in error.value.errors()
+    )
+
+
+# The schema sets `additionalProperties: false` on every node, with one exception:
+# AIContext's object form allows extras. OssieSemanticModel is a deliberate second
+# exception here — OssieDocument subclasses it, so the base has to tolerate the
+# subclass's own `version` key when a document payload is validated as a semantic
+# model (see test_document_is_a_semantic_model and
+# test_only_document_rejects_extra_fields).
+_LENIENT_BY_DESIGN = {"SemanticModel", "AIContext"}
+
+_MINIMAL_PAYLOADS = {
+    "CustomExtension": {"vendor_name": "ACME", "data": "{}"},
+    "DialectExpression": {"dialect": "ANSI_SQL", "expression": "x"},
+    "Expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "x"}]},
+    "Dimension": {"is_time": True},
+    "Field": {"name": "f", "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "x"}]}},
+    "Dataset": {"name": "orders", "source": "db.s.orders"},
+    "Relationship": {
+        "name": "r",
+        "from": "orders",
+        "to": "customers",
+        "from_columns": ["customer_id"],
+        "to_columns": ["id"],
+    },
+    "Metric": {"name": "m", "expression": {"dialects": [{"dialect": "ANSI_SQL", "expression": "x"}]}},
+}
+
+_MODELS_BY_SCHEMA_NODE = {
+    "CustomExtension": OssieCustomExtension,
+    "DialectExpression": OssieDialectExpression,
+    "Expression": OssieExpression,
+    "Dimension": OssieDimension,
+    "Field": OssieField,
+    "Dataset": OssieDataset,
+    "Relationship": OssieRelationship,
+    "Metric": OssieMetric,
+}
+
+
+def test_unknown_keys_are_rejected_wherever_the_schema_forbids_them() -> None:
+    """A model must not silently drop a key the schema would reject.
+
+    Checked by behaviour rather than by reading `model_config`, because a model
+    inherits its parent's policy and the resolved value is what callers actually hit.
+    """
+    schema_path = Path(__file__).parents[2] / "core-spec" / "ossie-schema.json"
+    schema = json.loads(schema_path.read_text())
+
+    for node, model in _MODELS_BY_SCHEMA_NODE.items():
+        assert schema["$defs"][node]["additionalProperties"] is False, (
+            f"{node} no longer forbids extras in the schema; update this test"
+        )
+        with pytest.raises(ValidationError) as error:
+            model.model_validate({**_MINIMAL_PAYLOADS[node], "not_in_the_spec": 1})
+        assert any(
+            item["loc"] == ("not_in_the_spec",) and item["type"] == "extra_forbidden"
+            for item in error.value.errors()
+        ), f"{node} accepted an unknown key"
+
+    # Every node the schema constrains is covered, so a new one cannot slip past.
+    constrained = {
+        node
+        for node, body in schema["$defs"].items()
+        if body.get("additionalProperties") is False
+    }
+    assert constrained - _LENIENT_BY_DESIGN == set(_MODELS_BY_SCHEMA_NODE)
+
+
+def test_unknown_nested_key_is_reported_with_its_path(document_data: dict) -> None:
+    """A typo inside a dataset used to be dropped silently on parse."""
+    document_data["datasets"][0]["descriptoin"] = "typo"
+
+    with pytest.raises(ValidationError) as error:
+        OssieDocument.model_validate(document_data)
+
+    assert any(
+        item["loc"] == ("datasets", 0, "descriptoin") and item["type"] == "extra_forbidden"
         for item in error.value.errors()
     )
 
